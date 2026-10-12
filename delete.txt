@@ -1,0 +1,9 @@
+Sr.No.	org_code	matadar_sangh_code	booth_id	voter_ser_no	unknown_value	glob_deleted	glob_duplicate	full_name	e_full_name	age	gender	house_no	voter_id	voter_address1	evoter_address1	booth_address	e_booth_address	e_booth_name	booth_name	voter_is_alive	mobile_no	optional_contact	type	imp_voter	voter_cast_religion	voter_address2	influence	voter_profession	comment	voting_status	others	eothers	part_no	vidh_no
+
+deleted means shifted 
+
+like last voters with shifted word in their row.
+
+vidh_no will be blank. there is part number in the pdf. 
+
+keep the booth_name 
