@@ -164,12 +164,56 @@ def extract_pdf_records(pdf_path: str, is_marathi: bool = False):
             
     return records
 
-def process_electoral_rolls(
-    en_pdf: str, 
-    mr_pdf: str, 
-    output_csv: str = "output/voters_extracted.csv", 
-    output_json: str = "output/voters_extracted.json"
-):
+def extract_pdf_metadata(pdf_path: str):
+    """
+    Extracts metadata such as Part No and District from the header of the PDF.
+    """
+    if not os.path.exists(pdf_path):
+        return {}
+    proc = subprocess.Popen(
+        ['pdftotext', '-bbox-layout', '-f', '1', '-l', '1', pdf_path, '-'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    stdout, _ = proc.communicate()
+    root = ET.fromstring(stdout)
+    ns = {'x': 'http://www.w3.org/1999/xhtml'}
+    
+    meta = {'part_no': '', 'district': ''}
+    for p in root.findall('.//x:page', ns)[:1]:
+        for l in p.findall('.//x:line', ns):
+            text = ' '.join(w.text for w in l.findall('.//x:word', ns) if w.text)
+            m_part = re.search(r'(?:Part\s*No\.?|भाग\s*क्रमांक)\s*[:.]?\s*(\d+)', text, re.I)
+            if m_part:
+                meta['part_no'] = m_part.group(1).strip()
+            m_dist = re.search(r'(?:District|िजल्ह्याचे\s*नाव)\s*[:.]?\s*([^\n\r]+)', text, re.I)
+            if m_dist:
+                meta['district'] = m_dist.group(1).strip()
+    return meta
+
+def extract_house_no(address: str) -> str:
+    """
+    Attempts to extract house number / plot number from the beginning of an address.
+    """
+    if not address:
+        return ""
+    first_part = address.split(',')[0].strip()
+    m = re.match(r'^(?:H\s*N|H\s*No|Plot\s*No|House\s*No)?\s*([0-9]+[A-Za-z0-9\/\-]*)', first_part, re.I)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+def process_electoral_roll_pair(en_pdf: str, mr_pdf: str):
+    """
+    Extracts and merges records from an English and Marathi PDF pair.
+    Returns (part_no, output1_rows, output2_rows)
+    """
+    print(f"[*] Extracting metadata for pair...")
+    en_meta = extract_pdf_metadata(en_pdf)
+    mr_meta = extract_pdf_metadata(mr_pdf)
+    part_no = en_meta.get('part_no') or mr_meta.get('part_no') or ''
+    print(f"[*] Extracted Part No: {part_no}")
+
     print(f"[*] Extracting English PDF: {en_pdf}...")
     en_records = extract_pdf_records(en_pdf, is_marathi=False)
     en_map = {r['sr_no']: r for r in en_records}
@@ -179,9 +223,11 @@ def process_electoral_rolls(
     mr_map = {r['sr_no']: r for r in mr_records}
 
     all_srs = sorted(list(set(en_map.keys()) | set(mr_map.keys())))
-    print(f"[*] Total unique voters found: {len(all_srs)}")
+    print(f"[*] Found {len(all_srs)} voters for Part No {part_no}")
 
-    combined_rows = []
+    out1_rows = []
+    out2_rows = []
+
     for sr in all_srs:
         en = en_map.get(sr, {})
         mr = mr_map.get(sr, {})
@@ -189,7 +235,38 @@ def process_electoral_rolls(
         epic_no = mr.get('epic_no') or en.get('epic_no') or ''
         age = en.get('age') or mr.get('age') or ''
 
-        combined_rows.append({
+        # Shifted / deleted detection
+        shifted_note = en.get('shifted_note') or mr.get('shifted_note') or ''
+        is_shifted = bool(shifted_note and ('shifted' in shifted_note.lower() or 'स्थलांतरीत' in shifted_note))
+        glob_deleted = "1" if is_shifted else ""
+
+        # Gender mapping: M and F
+        g_en = (en.get('gender') or '').strip().upper()
+        g_mr = (mr.get('gender') or '').strip()
+        if g_en in ('M', 'MALE') or 'पुरुष' in g_mr:
+            gender_val = 'M'
+        elif g_en in ('F', 'FEMALE') or 'स्त्री' in g_mr:
+            gender_val = 'F'
+        else:
+            gender_val = g_en if g_en else g_mr
+
+        # House No extraction
+        house_no = extract_house_no(en.get('address', '')) or extract_house_no(mr.get('address', ''))
+
+        # Qualification and occupation combined for voter_profession
+        qual_en = en.get('qualification', '').strip()
+        occ_en = en.get('occupation', '').strip()
+        if qual_en and occ_en:
+            voter_profession_val = f"{qual_en} - {occ_en}"
+        elif qual_en:
+            voter_profession_val = qual_en
+        elif occ_en:
+            voter_profession_val = occ_en
+        else:
+            voter_profession_val = ""
+
+        # Row for output1 (original schema)
+        out1_rows.append({
             'sr_no': sr,
             'elector_name_mr': mr.get('elector_name', ''),
             'elector_name_en': en.get('elector_name', ''),
@@ -198,23 +275,98 @@ def process_electoral_rolls(
             'address_mr': mr.get('address', ''),
             'address_en': en.get('address', ''),
             'qualification_mr': mr.get('qualification', ''),
-            'qualification_en': en.get('qualification', ''),
+            'qualification_en': qual_en,
             'occupation_mr': mr.get('occupation', ''),
-            'occupation_en': en.get('occupation', ''),
+            'occupation_en': occ_en,
             'age': age,
             'gender_mr': mr.get('gender', ''),
             'gender_en': en.get('gender', ''),
             'epic_no': epic_no,
             'photo_status': en.get('photo_status') or mr.get('photo_status', 'Available'),
-            'shifted_note': en.get('shifted_note') or mr.get('shifted_note', '')
+            'shifted_note': shifted_note
         })
 
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
-    os.makedirs(os.path.dirname(os.path.abspath(output_json)), exist_ok=True)
+        # Row for output2 (new updated 35-col schema)
+        out2_rows.append({
+            "Sr.No.": sr,
+            "org_code": "",
+            "matadar_sangh_code": "",
+            "booth_id": part_no,
+            "voter_ser_no": sr,
+            "unknown_value": "",
+            "glob_deleted": glob_deleted,
+            "glob_duplicate": "",
+            "full_name": mr.get('elector_name', ''),
+            "e_full_name": en.get('elector_name', ''),
+            "age": age,
+            "gender": gender_val,
+            "house_no": house_no,
+            "voter_id": epic_no,
+            "voter_address1": mr.get('address', ''),
+            "evoter_address1": en.get('address', ''),
+            "booth_address": "",
+            "e_booth_address": "",
+            "e_booth_name": "",
+            "booth_name": "",
+            "voter_is_alive": "True",
+            "mobile_no": "",
+            "optional_contact": "",
+            "type": "",
+            "imp_voter": "",
+            "voter_cast_religion": "",
+            "voter_address2": "",
+            "influence": "",
+            "voter_profession": voter_profession_val,
+            "comment": shifted_note if shifted_note else "",
+            "voting_status": "",
+            "others": "",
+            "eothers": "",
+            "part_no": part_no,
+            "vidh_no": ""
+        })
 
-    # Save to CSV (UTF-8 with BOM for proper display in Excel & Google Sheets)
-    fieldnames = [
+    return part_no, out1_rows, out2_rows
+
+def find_pdf_pairs(files_dir: str):
+    """
+    Finds all matching (EN, MR) PDF pairs in files_dir.
+    Matches files with patterns like <prefix>_EN.pdf and <prefix>_MR.pdf.
+    """
+    files_path = Path(files_dir)
+    if not files_path.exists():
+        return []
+
+    groups = {}
+    for p in files_path.glob("*.pdf"):
+        m = re.match(r'^(.*)_(EN|MR)\.pdf$', p.name, re.I)
+        if m:
+            base, lang = m.group(1), m.group(2).upper()
+            groups.setdefault(base, {})[lang] = str(p)
+
+    pairs = []
+    for base in sorted(groups.keys()):
+        en_file = groups[base].get('EN')
+        mr_file = groups[base].get('MR')
+        if en_file and mr_file:
+            pairs.append((en_file, mr_file))
+        else:
+            print(f"[!] Warning: Incomplete pair for prefix {base}: {groups[base]}")
+    return pairs
+
+def process_all_rolls(
+    files_dir: str = "files",
+    output1_dir: str = "output1",
+    output2_dir: str = "output2"
+):
+    pairs = find_pdf_pairs(files_dir)
+    if not pairs:
+        print(f"[!] No matching EN/MR PDF pairs found in '{files_dir}'.")
+        return []
+
+    print(f"[*] Found {len(pairs)} PDF pair(s) to process in '{files_dir}'.")
+
+    # 1. Output1 fieldnames (original schema)
+    output1_fieldnames = [
         'sr_no',
         'elector_name_mr',
         'elector_name_en',
@@ -234,50 +386,92 @@ def process_electoral_rolls(
         'shifted_note'
     ]
 
-    with open(output_csv, mode='w', encoding='utf-8-sig', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    # 2. Output2 fieldnames (exact 35 columns requested by user)
+    output2_fieldnames = [
+        "Sr.No.",
+        "org_code",
+        "matadar_sangh_code",
+        "booth_id",
+        "voter_ser_no",
+        "unknown_value",
+        "glob_deleted",
+        "glob_duplicate",
+        "full_name",
+        "e_full_name",
+        "age",
+        "gender",
+        "house_no",
+        "voter_id",
+        "voter_address1",
+        "evoter_address1",
+        "booth_address",
+        "e_booth_address",
+        "e_booth_name",
+        "booth_name",
+        "voter_is_alive",
+        "mobile_no",
+        "optional_contact",
+        "type",
+        "imp_voter",
+        "voter_cast_religion",
+        "voter_address2",
+        "influence",
+        "voter_profession",
+        "comment",
+        "voting_status",
+        "others",
+        "eothers",
+        "part_no",
+        "vidh_no"
+    ]
+
+    all_output1_rows = []
+    all_output2_rows = []
+
+    for en_pdf, mr_pdf in pairs:
+        print(f"\n---> Processing: {os.path.basename(en_pdf)} & {os.path.basename(mr_pdf)}")
+        part_no, out1, out2 = process_electoral_roll_pair(en_pdf, mr_pdf)
+        all_output1_rows.extend(out1)
+        all_output2_rows.extend(out2)
+
+    # Re-index Sr.No. across all combined records sequentially for output2
+    for idx, row in enumerate(all_output2_rows, start=1):
+        row["Sr.No."] = idx
+
+    # Ensure output directories exist
+    os.makedirs(output1_dir, exist_ok=True)
+    os.makedirs(output2_dir, exist_ok=True)
+
+    output1_csv = os.path.join(output1_dir, "voters_extracted.csv")
+    output2_csv = os.path.join(output2_dir, "voters_extracted.csv")
+
+    # Save single output1 CSV
+    with open(output1_csv, mode='w', encoding='utf-8-sig', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=output1_fieldnames)
         writer.writeheader()
-        writer.writerows(combined_rows)
+        writer.writerows(all_output1_rows)
+    print(f"\n[✓] Successfully exported total {len(all_output1_rows)} records to single CSV in output1: {output1_csv}")
 
-    print(f"[✓] Successfully exported {len(combined_rows)} records to CSV: {output_csv}")
+    # Save single output2 CSV
+    with open(output2_csv, mode='w', encoding='utf-8-sig', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=output2_fieldnames)
+        writer.writeheader()
+        writer.writerows(all_output2_rows)
+    print(f"[✓] Successfully exported total {len(all_output2_rows)} records to single CSV in output2: {output2_csv}")
 
-    # Save to JSON
-    with open(output_json, mode='w', encoding='utf-8') as f:
-        json.dump(combined_rows, f, ensure_ascii=False, indent=2)
-
-    print(f"[✓] Successfully exported {len(combined_rows)} records to JSON: {output_json}")
-
-    return combined_rows
+    return all_output2_rows
 
 if __name__ == '__main__':
     base_dir = Path(__file__).resolve().parent
-    
-    # Check input PDFs in files/ folder or root directory
-    en_file = base_dir / "files" / "GAC7_DIST471_PART247_EN.pdf"
-    if not en_file.exists():
-        en_file = base_dir / "GAC7_DIST471_PART247_EN.pdf"
+    files_dir = base_dir / "498"
+    output1_dir = base_dir / "output1"
+    output2_dir = base_dir / "output2"
 
-    mr_file = base_dir / "files" / "GAC7_DIST471_PART247_MR.pdf"
-    if not mr_file.exists():
-        mr_file = base_dir / "GAC7_DIST471_PART247_MR.pdf"
-
-    if not en_file.exists() or not mr_file.exists():
-        print(f"Error: Could not find input PDFs in {base_dir / 'files'} or {base_dir}")
-        sys.exit(1)
-
-    output_dir = base_dir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    output_csv = output_dir / "voters_extracted.csv"
-    output_json = output_dir / "voters_extracted.json"
-
-    records = process_electoral_rolls(
-        str(en_file), 
-        str(mr_file), 
-        str(output_csv), 
-        str(output_json)
+    records = process_all_rolls(
+        files_dir=str(files_dir),
+        output1_dir=str(output1_dir),
+        output2_dir=str(output2_dir)
     )
-    print("\nSample Cleaned Record (Sr No 1):")
-    print(json.dumps(records[0], ensure_ascii=False, indent=2))
+    print(f"\n[✓] All files completed. Total extracted records: {len(records)}.")
 
 
