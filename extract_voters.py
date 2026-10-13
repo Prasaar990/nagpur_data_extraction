@@ -46,6 +46,21 @@ def get_col_index(x_start: float) -> int:
             return i
     return -1
 
+def is_status_annotation(text: str) -> bool:
+    """
+    Detects overlay and status notes such as [DELETED], [Shifted to: ...], [Shifted from: ...].
+    Excludes footer text/legend explanations.
+    """
+    t_clean = text.strip()
+    if 'Indicates that the elector' in t_clean or 'Serial Number —' in t_clean:
+        return False
+    t_upper = t_clean.upper()
+    if any(k in t_upper for k in ['DELET', 'SHIFTED', 'स्थलांतरीत', 'वगळ', 'कमी', 'रद्द']):
+        return True
+    if re.search(r'^\d+\s*/\s*\d+\]?$', t_clean):
+        return True
+    return False
+
 def clean_marathi_text(text: str) -> str:
     """
     Fixes visual encoding artifacts produced by PDFKit/Cairo for Devanagari:
@@ -111,16 +126,45 @@ def extract_pdf_records(pdf_path: str, is_marathi: bool = False):
             lines.append({'xMin': x_min, 'yMin': y_min, 'text': line_text})
 
         # Identify rows starting with Sr No in column 0
-        sr_lines = [
+        # In PDF table layout, 4-digit numbers (>= 1000) wrap across multiple lines (e.g., '116' on line 1, '5' on line 2)
+        sr_raw_lines = [
             l for l in lines 
             if 30.0 <= l['xMin'] < 60.0 and l['yMin'] > 195 and l['text'].strip().isdigit()
         ]
-        sr_lines.sort(key=lambda item: item['yMin'])
+        sr_raw_lines.sort(key=lambda item: item['yMin'])
+
+        # Group lines that belong to the same multi-line Sr No (close vertically)
+        sr_lines = []
+        skip_indices = set()
+        for idx, l in enumerate(sr_raw_lines):
+            if idx in skip_indices:
+                continue
+            
+            combined_text = l['text'].strip()
+            top_y = l['yMin']
+            
+            # Check if next line(s) are part of this Sr No (vertical gap typically <= 15 points)
+            curr_idx = idx
+            while curr_idx + 1 < len(sr_raw_lines):
+                next_l = sr_raw_lines[curr_idx + 1]
+                # If the vertical distance is small (same cell), concatenate the digits
+                if next_l['yMin'] - sr_raw_lines[curr_idx]['yMin'] <= 16.0:
+                    combined_text += next_l['text'].strip()
+                    curr_idx += 1
+                    skip_indices.add(curr_idx)
+                else:
+                    break
+            
+            sr_lines.append({
+                'xMin': l['xMin'],
+                'yMin': top_y,
+                'text': combined_text
+            })
 
         for i, sr_item in enumerate(sr_lines):
             sr = int(sr_item['text'].strip())
             top_y = sr_item['yMin'] - 4.0
-            bottom_y = sr_lines[i+1]['yMin'] - 4.0 if i + 1 < len(sr_lines) else 785.0
+            bottom_y = sr_lines[i+1]['yMin'] - 4.0 if i + 1 < len(sr_lines) else min(sr_item['yMin'] + 80.0, 785.0)
             
             row_lines = [
                 l for l in lines 
@@ -131,7 +175,7 @@ def extract_pdf_records(pdf_path: str, is_marathi: bool = False):
             shifted_notes = []
             
             for l in row_lines:
-                if 'Shifted to:' in l['text'] or '[Shifted to' in l['text']:
+                if is_status_annotation(l['text']):
                     shifted_notes.append(l['text'])
                     continue
                 c = get_col_index(l['xMin'])
@@ -237,8 +281,22 @@ def process_electoral_roll_pair(en_pdf: str, mr_pdf: str):
 
         # Shifted / deleted detection
         shifted_note = en.get('shifted_note') or mr.get('shifted_note') or ''
-        is_shifted = bool(shifted_note and ('shifted' in shifted_note.lower() or 'स्थलांतरीत' in shifted_note))
-        glob_deleted = "1" if is_shifted else ""
+        note_lower = shifted_note.lower()
+        is_shifted_from = bool(re.search(r'shifted\s*from', note_lower) or 'येथून स्थलांतरीत' in note_lower or 'येथून' in note_lower)
+
+        if shifted_note and not is_shifted_from:
+            is_deleted_or_shifted = any(k in note_lower for k in [
+                'deleted', 'delet', 'shifted', 'स्थलांतरीत', 'वगळ', 'कमी', 'रद्द'
+            ])
+        elif shifted_note and is_shifted_from:
+            # Only marked deleted if explicitly stated (e.g. deleted/cancelled)
+            is_deleted_or_shifted = any(k in note_lower for k in [
+                'deleted', 'delet', 'वगळ', 'कमी', 'रद्द'
+            ])
+        else:
+            is_deleted_or_shifted = False
+
+        glob_deleted = "1" if is_deleted_or_shifted else ""
 
         # Gender mapping: M and F
         g_en = (en.get('gender') or '').strip().upper()
@@ -463,7 +521,7 @@ def process_all_rolls(
 
 if __name__ == '__main__':
     base_dir = Path(__file__).resolve().parent
-    files_dir = base_dir / "498"
+    files_dir = base_dir / "files/484"
     output1_dir = base_dir / "output1"
     output2_dir = base_dir / "output2"
 
