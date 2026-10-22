@@ -46,19 +46,34 @@ def get_col_index(x_start: float) -> int:
             return i
     return -1
 
-def is_status_annotation(text: str) -> bool:
+def is_status_annotation(text: str, x_min: float = 0.0, max_status_x: float = 218.0) -> bool:
     """
     Detects overlay and status notes such as [DELETED], [Shifted to: ...], [Shifted from: ...].
-    Excludes footer text/legend explanations.
+    Status annotations only appear as overlay tags over elector name/serial (columns 0-2, x < max_status_x).
+    Excludes footer text/legend explanations and regular voter fields.
     """
+    if x_min >= max_status_x:
+        return False
+
     t_clean = text.strip()
+    if not t_clean:
+        return False
     if 'Indicates that the elector' in t_clean or 'Serial Number —' in t_clean:
         return False
-    t_upper = t_clean.upper()
-    if any(k in t_upper for k in ['DELET', 'SHIFTED', 'स्थलांतरीत', 'वगळ', 'कमी', 'रद्द']):
+
+    # Bracketed status annotations: [DELETED], [Shifted to: ...], [Shifted from: ...], etc.
+    if re.search(r'\[\s*(?:DELET|SHIFT)', t_clean, re.I):
         return True
+
+    # Standalone DELETED or SHIFTED phrases
+    t_upper = t_clean.upper()
+    if t_upper in ('[DELETED]', 'DELETED') or t_upper.startswith(('SHIFTED TO', 'SHIFTED FROM', '[SHIFTED')):
+        return True
+
+    # Wrapped line of shifted annotation e.g. '421/722]' or '421 / 722]'
     if re.search(r'^\d+\s*/\s*\d+\]?$', t_clean):
         return True
+
     return False
 
 def clean_marathi_text(text: str) -> str:
@@ -175,7 +190,7 @@ def extract_pdf_records(pdf_path: str, is_marathi: bool = False):
             shifted_notes = []
             
             for l in row_lines:
-                if is_status_annotation(l['text']):
+                if is_status_annotation(l['text'], l['xMin'], COL_BOUNDS[3][0]):
                     shifted_notes.append(l['text'])
                     continue
                 c = get_col_index(l['xMin'])
@@ -282,21 +297,20 @@ def process_electoral_roll_pair(en_pdf: str, mr_pdf: str):
         # Shifted / deleted detection
         shifted_note = en.get('shifted_note') or mr.get('shifted_note') or ''
         note_lower = shifted_note.lower()
-        is_shifted_from = bool(re.search(r'shifted\s*from', note_lower) or 'येथून स्थलांतरीत' in note_lower or 'येथून' in note_lower)
+        is_shifted_from = bool(re.search(r'shifted\s*from', note_lower))
 
-        if shifted_note and not is_shifted_from:
-            is_deleted_or_shifted = any(k in note_lower for k in [
-                'deleted', 'delet', 'shifted', 'स्थलांतरीत', 'वगळ', 'कमी', 'रद्द'
-            ])
-        elif shifted_note and is_shifted_from:
-            # Only marked deleted if explicitly stated (e.g. deleted/cancelled)
-            is_deleted_or_shifted = any(k in note_lower for k in [
-                'deleted', 'delet', 'वगळ', 'कमी', 'रद्द'
-            ])
+        # "Shifted from" voters moved into this booth from elsewhere, so they are ACTIVE (never deleted)
+        if is_shifted_from:
+            is_deleted_or_shifted = False
+        elif shifted_note:
+            # Only English 'deleted' or 'shifted to' are marked as glob_deleted
+            is_deleted_or_shifted = bool(
+                re.search(r'delet', note_lower) or re.search(r'shifted\s*to', note_lower)
+            )
         else:
             is_deleted_or_shifted = False
 
-        glob_deleted = "1" if is_deleted_or_shifted else ""
+        glob_deleted = "1" if is_deleted_or_shifted else "0"
 
         # Gender mapping: M and F
         g_en = (en.get('gender') or '').strip().upper()
@@ -344,16 +358,15 @@ def process_electoral_roll_pair(en_pdf: str, mr_pdf: str):
             'shifted_note': shifted_note
         })
 
-        # Row for output2 (new updated 35-col schema)
+        # Row for output2 (updated schema)
         out2_rows.append({
             "Sr.No.": sr,
-            "org_code": "",
+            "org_code": "EITOT",
             "matadar_sangh_code": "",
             "booth_id": part_no,
             "voter_ser_no": sr,
-            "unknown_value": "",
             "glob_deleted": glob_deleted,
-            "glob_duplicate": "",
+            "glob_duplicate": "0",
             "full_name": mr.get('elector_name', ''),
             "e_full_name": en.get('elector_name', ''),
             "age": age,
@@ -376,9 +389,7 @@ def process_electoral_roll_pair(en_pdf: str, mr_pdf: str):
             "influence": "",
             "voter_profession": voter_profession_val,
             "comment": shifted_note if shifted_note else "",
-            "voting_status": "",
-            "others": "",
-            "eothers": "",
+            "voting_status": "FALSE",
             "part_no": part_no,
             "vidh_no": ""
         })
@@ -444,14 +455,13 @@ def process_all_rolls(
         'shifted_note'
     ]
 
-    # 2. Output2 fieldnames (exact 35 columns requested by user)
+    # 2. Output2 fieldnames
     output2_fieldnames = [
         "Sr.No.",
         "org_code",
         "matadar_sangh_code",
         "booth_id",
         "voter_ser_no",
-        "unknown_value",
         "glob_deleted",
         "glob_duplicate",
         "full_name",
@@ -477,8 +487,6 @@ def process_all_rolls(
         "voter_profession",
         "comment",
         "voting_status",
-        "others",
-        "eothers",
         "part_no",
         "vidh_no"
     ]
@@ -500,8 +508,8 @@ def process_all_rolls(
     os.makedirs(output1_dir, exist_ok=True)
     os.makedirs(output2_dir, exist_ok=True)
 
-    output1_csv = os.path.join(output1_dir, "voters_extracted.csv")
-    output2_csv = os.path.join(output2_dir, "voters_extracted.csv")
+    output1_csv = os.path.join(output1_dir, "496_without_new.csv")
+    output2_csv = os.path.join(output2_dir, "496_without_new.csv")
 
     # Save single output1 CSV
     with open(output1_csv, mode='w', encoding='utf-8-sig', newline='') as f:
@@ -521,7 +529,7 @@ def process_all_rolls(
 
 if __name__ == '__main__':
     base_dir = Path(__file__).resolve().parent
-    files_dir = base_dir / "files/484"
+    files_dir = base_dir / "files/496_without_new"
     output1_dir = base_dir / "output1"
     output2_dir = base_dir / "output2"
 

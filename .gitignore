@@ -4,3 +4,7 @@
 
 /single_file
 *.pyc
+
+/output1
+/output2
+/output3
